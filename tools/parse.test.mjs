@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseValidateOutput, parseHooks, parseCalls } from './parse.mjs'
 import { grade, visibility, drawsOn } from './grade.mjs'
-import { validate, relativePaths } from './validate.mjs'
+import { validate, validateAsync, spawnAsync, relativePaths } from './validate.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -166,6 +166,20 @@ test('a repository GitHub reports under a new name collapses onto that name', ()
   assert.equal(renamePairs(mods, currentName, stale).size, 0, 'a retained record of a failed clone never hides a fresh copy')
 })
 
+test('two old names of a repository whose current name is not a candidate collapse onto one', () => {
+  const plugin = (repo, sourceCommit = 'c1') => ({ id: `${repo}:plugin`, repo, path: 'plugin', sourceCommit, kind: 'mod' })
+  const mods = [plugin('o/prompt-bar'), plugin('o/ClauDiscombobulating'), plugin('o/other')]
+  const currentName = new Map([['o/prompt-bar', 'o/ClauDiscobombulating'], ['o/claudiscombobulating', 'o/ClauDiscobombulating'], ['o/other', 'o/other']])
+  const fresh = new Set(mods.map(m => m.id))
+  const pairs = renamePairs(mods, currentName, fresh)
+  assert.deepEqual([...pairs], [['o/prompt-bar:plugin', 'o/ClauDiscombobulating:plugin']])
+  assert.deepEqual(applyDuplicates(structuredClone(mods), pairs).filter(m => m.kind === 'mod').map(m => m.id), ['o/ClauDiscombobulating:plugin', 'o/other:plugin'])
+  assert.equal(renamePairs([plugin('o/prompt-bar', 'c2'), mods[1]], currentName, new Set(['o/prompt-bar:plugin', 'o/ClauDiscombobulating:plugin'])).size, 0, 'different commits are not proven to be one checkout')
+  assert.equal(renamePairs(mods, currentName, new Set(['o/ClauDiscombobulating:plugin'])).size, 0, 'a retained record never joins a pair')
+  const listed = [...mods, plugin('o/ClauDiscobombulating')]
+  assert.deepEqual([...renamePairs(listed, currentName, new Set(listed.map(m => m.id)))].sort(), [['o/ClauDiscombobulating:plugin', 'o/ClauDiscobombulating:plugin'], ['o/prompt-bar:plugin', 'o/ClauDiscobombulating:plugin']], 'a fresh copy under the current name still wins')
+})
+
 test('rename pairs keep plugin paths case-sensitive', () => {
   const mods = [
     { id: 'o/old:plugins/A', repo: 'o/old', path: 'plugins/A', kind: 'mod' },
@@ -214,6 +228,8 @@ test('kindOf files built-ins, fixtures, mirrors and catalogue copies, and counts
   assert.equal(kindOf('a/b', 'mods/abilities/bench', { name: 'bench', description: 'Not a plugin to install.' }, new Set(), exceptions), 'fixture', 'a description that rules it out still wins')
   assert.equal(kindOf('a/b', 'plugins/clip', { name: 'clip' }), 'mod')
   assert.equal(kindOf('a/b', '.', { name: 'x', description: 'A test fixture, not a product mod' }), 'fixture')
+  assert.equal(kindOf('a/b', 'tools/demo', { name: 'x-demo', description: 'Development only: plays a scripted turn for screenshots.' }), 'fixture')
+  assert.equal(kindOf('a/b', '.', { name: 'x', description: 'Speeds up development only when tests pass.' }), 'mod', 'the phrase must open the description')
   assert.equal(kindOf('a/b', 'skills/builder/assets/probe-mod', { name: 'probe-mod', description: '[probe] Loaded headlessly by the builder. Not a mod to install.' }), 'fixture')
   assert.equal(kindOf('a/b', 'plugins/clip', { name: 'clip', description: 'A mod to install from the marketplace.' }), 'mod')
   assert.equal(kindOf('a/b', 'upstreams/claude-code/mods/telemetry', { name: 'telemetry' }), 'fixture')
@@ -231,6 +247,27 @@ test('kindOf files built-ins, fixtures, mirrors and catalogue copies, and counts
 test('fixtures never count', () => {
   const after = clone(); after.mods[1].calls = ['$.http.fetch']
   assert.equal(fingerprint(base), fingerprint(after))
+})
+
+test('course exercises stay out while finished mods and unrelated repositories count', () => {
+  const paths = [
+    '02-first-mod/broken/2-5-syntax-error',
+    '03-events/3-1-start', '03-events/3-2-start', '03-events/3-3-start', '03-events/3-4-start', '03-events/3-5-secret-guard',
+    '04-test-pilot/4-4-start', '05-ui/broken/5-4-refused',
+    '08-testing/errors/1-hook-skipped', '08-testing/errors/2-worker-crash', '08-testing/errors/3-refused',
+    '08-testing/errors/4-reload-failed', '08-testing/errors/5-no-command-hook', '09-distribution/tool-tally',
+  ]
+  for (const path of paths) {
+    assert.equal(kindOf('kurushiba/claude-mods', path, { name: 'lesson' }), 'fixture', path)
+    assert.equal(kindOf('another/claude-mods', path, { name: 'lesson' }), 'mod', path)
+  }
+  for (const path of ['.', 'final/test-pilot', 'final/model-router', 'plugins/error-monitor', '03-events-dashboard']) {
+    assert.equal(kindOf('kurushiba/claude-mods', path, { name: 'finished' }), 'mod', path)
+  }
+  assert.equal(kindOf('Kurushiba/claude-mods', paths[0], {}), 'fixture')
+  const exceptions = new Set([`kurushiba/claude-mods:${paths[0]}`])
+  assert.equal(kindOf('kurushiba/claude-mods', paths[0], {}, new Set(), exceptions), 'mod')
+  assert.equal(kindOf('kurushiba/claude-mods', paths[0], { description: 'A test fixture.' }, new Set(), exceptions), 'fixture')
 })
 
 test('benchmark fixtures stay out without excluding usable evaluation mods', () => {
@@ -265,7 +302,7 @@ test('a scan that lost most of its mods or repos is partial, a small dip is not'
   assert.equal(looksPartial({ repos: 0, mods: [] }, few), null)
 })
 
-test('validator errors keep paths relative to the scanned repository', t => {
+test('validator errors keep paths relative to the scanned repository', async t => {
   const root = mkdtempSync(join(tmpdir(), 'validate-paths-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const checkout = join(root, 'clones', 'owner__repo')
@@ -277,11 +314,26 @@ test('validator errors keep paths relative to the scanned repository', t => {
   process.env.PATH = join(root, 'bin') + ':' + path
   t.after(() => { process.env.PATH = path })
   const result = validate('.', checkout, [checkout, join(root, 'clones')])
+  assert.deepEqual(await validateAsync('.', checkout, [checkout, join(root, 'clones')]), result, 'the scanner\'s non-blocking call parses the same result')
   assert.equal(result.status, 'failed')
   assert.ok(result.errors.length > 0)
   for (const error of result.errors) assert.ok(!error.includes(root), error)
   assert.match(result.errors.join('\n'), /plugins\/demo\/hooks\/register\.ts: no such file \(from other__repo\/x\.ts\)/)
   assert.equal(relativePaths('/tmp/c/owner__repo', ['/tmp/c/owner__repo']), '.')
+})
+
+test('a non-blocking spawn reports what spawnSync reports', async () => {
+  const cases = [
+    [process.execPath, ['-e', 'process.stdout.write("out"); process.stderr.write("err"); process.exit(3)']],
+    ['no-such-validator-binary', []],
+    [process.execPath, ['-e', 'setTimeout(() => {}, 5000)']],
+  ]
+  for (const [command, args] of cases) {
+    const sync = spawnSync(command, args, { encoding: 'utf8', timeout: 500 })
+    const result = await spawnAsync(command, args, { timeout: 500 })
+    assert.deepEqual([result.status, result.signal, result.error?.code], [sync.status, sync.signal, sync.error?.code], command)
+    if (!sync.error) assert.deepEqual([result.stdout, result.stderr], [sync.stdout, sync.stderr])
+  }
 })
 
 test('the change check reads a committed scan larger than the default output buffer', t => {
